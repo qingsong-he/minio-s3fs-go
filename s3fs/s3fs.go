@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -35,15 +36,7 @@ func (s *s3fs) Open(minioPath string) (http.File, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &s3fsObj{
-			tp:        rootType,
-			s3fs:      s,
-			minioPath: minioPath,
-			isDir:     true,
-			buckets:   buckets,
-			objects:   nil,
-			minioObj:  nil,
-		}, nil
+		return s3fsObjPool.Get().(*s3fsObj).withValue(rootType, s, minioPath, true, buckets, nil, nil), nil
 
 	} else if strings.Count(minioPath, "/") == 1 {
 
@@ -63,15 +56,7 @@ func (s *s3fs) Open(minioPath string) (http.File, error) {
 			}
 			objs = append(objs, obj)
 		}
-		return &s3fsObj{
-			tp:        bucketType,
-			s3fs:      s,
-			minioPath: minioPath,
-			isDir:     true,
-			buckets:   nil,
-			objects:   objs,
-			minioObj:  nil,
-		}, nil
+		return s3fsObjPool.Get().(*s3fsObj).withValue(bucketType, s, minioPath, true, nil, objs, nil), nil
 
 	} else {
 		bucketName := strings.Split(minioPath, "/")[1]
@@ -91,32 +76,15 @@ func (s *s3fs) Open(minioPath string) (http.File, error) {
 			objs = append(objs, obj)
 		}
 		if len(objs) != 0 {
-			return &s3fsObj{
-				tp:        fileType,
-				s3fs:      s,
-				minioPath: minioPath,
-				isDir:     true,
-				buckets:   nil,
-				objects:   objs,
-				minioObj:  nil,
-			}, nil
+			return s3fsObjPool.Get().(*s3fsObj).withValue(fileType, s, minioPath, true, nil, objs, nil), nil
 		}
 
 		//
 		// it's file
 		//
 		obj, err := s.cli.GetObject(bucketName, prefix, minio.GetObjectOptions{})
-
 		if err == nil {
-			return &s3fsObj{
-				tp:        fileType,
-				s3fs:      s,
-				minioPath: minioPath,
-				isDir:     false,
-				buckets:   nil,
-				objects:   nil,
-				minioObj:  obj,
-			}, nil
+			return s3fsObjPool.Get().(*s3fsObj).withValue(fileType, s, minioPath, false, nil, nil, obj), nil
 		}
 	}
 
@@ -131,6 +99,12 @@ const (
 	fileType   minioType = 2
 )
 
+var s3fsObjPool = &sync.Pool{
+	New: func() interface{} {
+		return &s3fsObj{}
+	},
+}
+
 type s3fsObj struct {
 	tp minioType
 	*s3fs
@@ -141,11 +115,35 @@ type s3fsObj struct {
 	objects []minio.ObjectInfo
 
 	minioObj *minio.Object
+
+	objectInfoSet []os.FileInfo
+}
+
+func (s *s3fsObj) withValue(tp minioType, s3fsObj *s3fs, minioPath string, isDir bool, buckets []minio.BucketInfo, objects []minio.ObjectInfo, minioObj *minio.Object) *s3fsObj {
+	s.tp = tp
+	s.s3fs = s3fsObj
+	s.minioPath = minioPath
+	s.isDir = isDir
+	s.buckets = buckets
+	s.objects = objects
+	s.minioObj = minioObj
+	s.objectInfoSet = nil
+	return s
 }
 
 func (s *s3fsObj) Close() error {
 	if !s.isDir {
-		return s.minioObj.Close()
+		err := s.minioObj.Close()
+		s3fsObjPool.Put(s)
+		for _, v := range s.objectInfoSet {
+			objectInfoPool.Put(v)
+		}
+		return err
+	}
+
+	s3fsObjPool.Put(s)
+	for _, v := range s.objectInfoSet {
+		objectInfoPool.Put(v)
 	}
 	return nil
 }
@@ -174,43 +172,29 @@ func (s *s3fsObj) Readdir(_ int) ([]os.FileInfo, error) {
 	switch s.tp {
 	case rootType:
 		for _, bucket := range s.buckets {
-			fileInfos = append(fileInfos, &objectInfo{
-				isDir: true,
-				name:  bucket.Name,
-			})
+			fileInfos = append(fileInfos, objectInfoPool.Get().(*objectInfo).withValue(true, bucket.Name, 0, bucket.CreationDate))
 		}
 
 	case bucketType:
 		for _, object := range s.objects {
 			var isDir bool
-
 			if strings.HasSuffix(object.Key, "/") {
 				isDir = true
 			}
-
-			fileInfos = append(fileInfos, &objectInfo{
-				isDir:   isDir,
-				name:    filepath.Clean(object.Key),
-				objInfo: &object,
-			})
+			fileInfos = append(fileInfos, objectInfoPool.Get().(*objectInfo).withValue(isDir, filepath.Clean(object.Key), object.Size, object.LastModified))
 		}
 
 	case fileType:
 		for _, object := range s.objects {
-
 			var isDir bool
 			if strings.HasSuffix(object.Key, "/") {
 				isDir = true
 			}
-
-			fileInfos = append(fileInfos, &objectInfo{
-				isDir:   isDir,
-				name:    filepath.Base(object.Key),
-				objInfo: &object,
-			})
+			fileInfos = append(fileInfos, objectInfoPool.Get().(*objectInfo).withValue(isDir, filepath.Base(object.Key), object.Size, object.LastModified))
 		}
 	}
 
+	s.objectInfoSet = append(s.objectInfoSet, fileInfos...)
 	return fileInfos, nil
 }
 
@@ -220,23 +204,35 @@ func (s *s3fsObj) Stat() (os.FileInfo, error) {
 		if err != nil {
 			return nil, os.ErrNotExist
 		}
-		return &objectInfo{
-			objInfo: &info,
-			isDir:   false,
-			name:    s.minioPath,
-		}, nil
+		fInfo := objectInfoPool.Get().(*objectInfo).withValue(false, s.minioPath, info.Size, info.LastModified)
+		s.objectInfoSet = append(s.objectInfoSet, fInfo)
+		return fInfo, nil
 	}
 
-	return &objectInfo{
-		isDir: true,
-		name:  s.minioPath,
-	}, nil
+	fInfo := objectInfoPool.Get().(*objectInfo).withValue(true, s.minioPath, 0, time.Now())
+	s.objectInfoSet = append(s.objectInfoSet, fInfo)
+	return fInfo, nil
+}
+
+var objectInfoPool = &sync.Pool{
+	New: func() interface{} {
+		return &objectInfo{}
+	},
 }
 
 type objectInfo struct {
-	objInfo *minio.ObjectInfo
-	isDir   bool
-	name    string
+	size  int64
+	time  time.Time
+	isDir bool
+	name  string
+}
+
+func (o *objectInfo) withValue(isDir bool, name string, size int64, time time.Time) *objectInfo {
+	o.isDir = isDir
+	o.name = name
+	o.size = size
+	o.time = time
+	return o
 }
 
 func (o *objectInfo) Name() string {
@@ -244,10 +240,7 @@ func (o *objectInfo) Name() string {
 }
 
 func (o *objectInfo) Size() int64 {
-	if o.isDir {
-		return 0
-	}
-	return o.objInfo.Size
+	return o.size
 }
 
 func (o *objectInfo) Mode() os.FileMode {
@@ -258,10 +251,7 @@ func (o *objectInfo) Mode() os.FileMode {
 }
 
 func (o *objectInfo) ModTime() time.Time {
-	if o.isDir {
-		return time.Now()
-	}
-	return o.objInfo.LastModified
+	return o.time
 }
 
 func (o *objectInfo) IsDir() bool {
